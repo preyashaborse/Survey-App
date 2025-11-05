@@ -8,8 +8,10 @@ from pypdf import PdfReader
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from project root .env file
+# override=True ensures .env file values take precedence over system environment variables
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"), override=True)
+
 
 
 def read_pdf_text(file_bytes: bytes) -> Tuple[str, Dict[int, int]]:
@@ -98,7 +100,12 @@ def extract_field_value_with_gpt(
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable is not set. Please set it in your .env file.")
     
-    client = OpenAI(api_key=api_key)
+    project_id = os.getenv("OPENAI_PROJECT_ID")
+    
+    client = OpenAI(
+        api_key=api_key,
+        project=project_id
+    )
     
     # Prepare the prompt with location hints
     location_hint = ""

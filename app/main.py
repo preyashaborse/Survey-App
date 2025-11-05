@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+import traceback
 from app.models import ExtractRequest, ExtractResponse, FileExtractResponse, LocationInfo
 from app.extractor import (
     extract_field_value_with_gpt,
@@ -129,8 +130,10 @@ async def extract_from_file(file: UploadFile = File(...), field: str = Form(...)
         # Extract text with location metadata
         text, line_map, file_type = extract_text_from_file_with_location(file.filename, file_bytes)
     except ValueError as e:
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to read the uploaded file: {str(e)}")
 
     try:
@@ -154,8 +157,10 @@ async def extract_from_file(file: UploadFile = File(...), field: str = Form(...)
             location=location
         )
     except ValueError as e:
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to extract field using GPT-4o: {str(e)}")
 
 
