@@ -1,5 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends
+from app.auth.deps import get_current_user
+from app.auth.schemas import User
+from app.routers import auth
 import traceback
 from app.models import ExtractRequest, ExtractResponse, FileExtractResponse, LocationInfo
 from app.extractor import (
@@ -10,9 +14,11 @@ from app.extractor import (
 
 app = FastAPI(title="AI Autofill Service")
 
+app.include_router(auth.router)
+
 
 @app.post("/extract", response_model=ExtractResponse)
-async def extract_endpoint(payload: ExtractRequest) -> ExtractResponse:
+async def extract_endpoint(payload: ExtractRequest, current_user: User = Depends(get_current_user)) -> ExtractResponse:
     """Extract field value from text using GPT-4o"""
     try:
         value, location_data = extract_field_value_with_gpt(
@@ -123,7 +129,7 @@ def upload_form() -> HTMLResponse:
 
 
 @app.post("/extract_file", response_model=FileExtractResponse)
-async def extract_from_file(file: UploadFile = File(...), field: str = Form(...)) -> FileExtractResponse:
+async def extract_from_file(file: UploadFile = File(...), field: str = Form(...), current_user: User = Depends(get_current_user)) -> FileExtractResponse:
     """Extract field value from uploaded file using GPT-4o with location tracking"""
     try:
         file_bytes = await file.read()
