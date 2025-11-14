@@ -7,6 +7,7 @@ class LocationInfo(BaseModel):
     line_number: Optional[int] = None
     context: Optional[str] = None
     section: Optional[str] = None
+    docName: Optional[str] = None  # Document name for multi-document scenarios
 
 class BulkExtractRequest(BaseModel):
     document_text: str

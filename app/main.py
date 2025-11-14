@@ -26,21 +26,64 @@ app.include_router(auth.router)
 
 @app.post("/extract_file_bulk", response_model=BulkExtractResponse)
 async def extract_from_file_bulk(
-  file: UploadFile = File(...),
+  files: List[UploadFile] = File(...),  # Accept multiple files
   questions: str = Form(...),  # JSON-encoded list of question objects with id, text, type, and optional options
   current_user: User = Depends(get_current_user)
 ) -> BulkExtractResponse:
-  """Extract multiple field values from uploaded file using GPT-4.1 with location tracking, confidence scores, and citations."""
+  """Extract multiple field values from uploaded file(s) using GPT-4.1 with location tracking, confidence scores, and citations. Supports multiple PDF/DOCX files."""
   import json
   try:
-    file_bytes = await file.read()
-    text, line_map, file_type = extract_text_from_file_with_location(file.filename, file_bytes)
+    # Process all uploaded files
+    all_documents = []
+    combined_text_parts = []
+    combined_line_maps = []
+    file_types = []
+    filenames = []
+    
+    for file in files:
+      file_bytes = await file.read()
+      text, line_map, file_type = extract_text_from_file_with_location(file.filename, file_bytes)
+      
+      # Store document info
+      all_documents.append({
+        'filename': file.filename,
+        'text': text,
+        'line_map': line_map,
+        'file_type': file_type
+      })
+      
+      # Combine text with document markers
+      doc_marker = f"\n\n[Document: {file.filename}]\n"
+      combined_text_parts.append(doc_marker + text)
+      combined_line_maps.append((file.filename, line_map))
+      file_types.append(file_type)
+      filenames.append(file.filename)
+    
+    # Combine all documents into single text
+    combined_text = "\n".join(combined_text_parts)
+    
+    # Create combined line map (with document context)
+    # Store as simple dict for compatibility, document info is in all_documents
+    combined_line_map = {}
+    current_line_offset = 0
+    for filename, line_map in combined_line_maps:
+      for line_num, page_num in line_map.items():
+        # Store page number, document info available in all_documents
+        combined_line_map[current_line_offset + line_num] = page_num
+      # Estimate line count for offset (rough approximation)
+      doc_text = next((d['text'] for d in all_documents if d['filename'] == filename), '')
+      current_line_offset += len(doc_text.splitlines()) + 10  # Add buffer for document marker
+    
+    # Use primary file type (first file) for processing
+    primary_file_type = file_types[0] if file_types else None
+    primary_filename = filenames[0] if filenames else "combined_documents"
+    
   except ValueError as e:
     traceback.print_exc()
     raise HTTPException(status_code=400, detail=str(e))
   except Exception as e:
     traceback.print_exc()
-    raise HTTPException(status_code=500, detail=f"Failed to read the uploaded file: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"Failed to read the uploaded file(s): {str(e)}")
 
   try:
     # Parse questions list
@@ -51,13 +94,14 @@ async def extract_from_file_bulk(
     except Exception:
       raise HTTPException(status_code=400, detail="'questions' must be a JSON-encoded list of question objects with id, text, type, and optional options.")
 
-    # Use the new bulk extraction function that processes all questions at once
+    # Use the bulk extraction function with combined text and document info
     formatted_results = extract_bulk_questions_with_gpt(
-      text,
+      combined_text,
       questions_list,
-      file.filename,
-      line_to_location_map=line_map,
-      file_type=file_type
+      primary_filename,  # Use first filename as primary
+      line_to_location_map=combined_line_map,
+      file_type=primary_file_type,
+      all_documents=all_documents  # Pass all document info for better citations
     )
     
     # Convert to BulkExtractFieldResult format
@@ -161,8 +205,8 @@ def upload_form() -> HTMLResponse:
               <button class=\"logout-btn\" id=\"logoutBtn\">Logout</button>
             </div>
             <div class=\"row\">
-              <label for=\"file\">Document</label>
-              <input id=\"file\" name=\"file\" type=\"file\" accept=\".pdf,.docx\" />
+              <label for=\"file\">Document(s) - Select multiple PDF/DOCX files</label>
+              <input id=\"file\" name=\"file\" type=\"file\" accept=\".pdf,.docx\" multiple />
               <div id=\"filename\" class=\"muted mono\"></div>
             </div>
             <div class=\"row\">
@@ -239,12 +283,15 @@ def upload_form() -> HTMLResponse:
           // Function to get all answers at once
           async function getAllAnswers() {
             const fileInput = document.getElementById('file');
-            const f = fileInput.files?.[0];
-            if (!f) { alert('Please choose a file.'); return; }
+            const files = fileInput.files;
+            if (!files || files.length === 0) { alert('Please choose at least one file.'); return; }
             if (!token) { alert('Not authenticated. Please login first.'); return; }
             // Prepare questions list with full question objects
             const form = new FormData();
-            form.append('file', f);
+            // Append all selected files
+            for (let i = 0; i < files.length; i++) {
+              form.append('files', files[i]);
+            }
             form.append('questions', JSON.stringify(surveyQuestions));
             // Disable button while loading
             const btn = document.getElementById('getAllAnswersBtn');
@@ -309,6 +356,7 @@ def upload_form() -> HTMLResponse:
                   if (result.location) {
                     const loc = result.location;
                     locationHtml = `<div style=\"margin-top: 0.5rem; font-size: 0.95em;\">` +
+                      `${loc.docName ? `<div><strong>Document: ${loc.docName}</strong></div>` : ''}` +
                       `${loc.page_number ? `<div>Page: ${loc.page_number}</div>` : ''}` +
                       `${loc.paragraph_number ? `<div>Paragraph: ${loc.paragraph_number}</div>` : ''}` +
                       `${loc.line_number ? `<div>Line: ${loc.line_number}</div>` : ''}` +
@@ -440,8 +488,15 @@ def upload_form() -> HTMLResponse:
             const fileInput = document.getElementById('file');
             const filenameEl = document.getElementById('filename');
             fileInput.addEventListener('change', () => {
-              const f = fileInput.files?.[0];
-              filenameEl.textContent = f ? `Uploaded: ${f.name}` : '';
+              const files = fileInput.files;
+              if (files && files.length > 0) {
+                const fileNames = Array.from(files).map(f => f.name).join(', ');
+                filenameEl.textContent = files.length === 1 
+                  ? `Uploaded: ${fileNames}` 
+                  : `Uploaded ${files.length} files: ${fileNames}`;
+              } else {
+                filenameEl.textContent = '';
+              }
             });
           };
         </script>

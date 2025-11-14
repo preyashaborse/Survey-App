@@ -9,6 +9,7 @@ class LocationInfo(BaseModel):
     line_number: Optional[int] = None  # Line number in document
     context: Optional[str] = None  # Surrounding text or context
     section: Optional[str] = None  # Document section (e.g., "Header", "Body", "Footer")
+    docName: Optional[str] = None  # Document name for multi-document scenarios
 
 
 class ExtractRequest(BaseModel):

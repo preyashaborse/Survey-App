@@ -1,7 +1,8 @@
 import os
 import json
 import tiktoken
-from typing import Optional, Dict, Tuple
+import hashlib
+from typing import Optional, Dict, Tuple, List
 from io import BytesIO
 
 from docx import Document  # python-docx
@@ -75,6 +76,154 @@ def extract_text_from_file_with_location(filename: str, file_bytes: bytes) -> Tu
     raise ValueError("Unsupported file type. Please upload a .pdf or .docx file.")
 
 
+def chunk_document(
+    document_text: str,
+    chunk_size_tokens: int,
+    overlap_tokens: int = 0,
+    encoding_name: str = "o200k_base"
+) -> List[str]:
+    """
+    Chunk document into smaller pieces with optional overlap.
+    
+    Args:
+        document_text: Full document text to chunk
+        chunk_size_tokens: Target token size per chunk
+        overlap_tokens: Number of tokens to overlap between chunks (default: 0)
+        encoding_name: Tiktoken encoding to use
+    
+    Returns:
+        List of text chunks
+    """
+    # Create encoder once
+    enc = tiktoken.get_encoding(encoding_name)
+    
+    def num_tokens(text: str) -> int:
+        return len(enc.encode(text))
+    
+    # If document fits in one chunk, return as-is
+    doc_tokens = num_tokens(document_text)
+    if doc_tokens <= chunk_size_tokens:
+        return [document_text]
+    
+    chunks = []
+    max_chunk_chars = chunk_size_tokens * 4  # Rough estimate: 1 token ≈ 4 chars
+    
+    text = document_text
+    start = 0
+    
+    while start < len(text):
+        # Calculate end position
+        end = min(len(text), start + max_chunk_chars)
+        chunk = text[start:end]
+        
+        # Try to not break in the middle of a line
+        if end < len(text):
+            next_nl = text.find("\n", end)
+            if next_nl != -1 and next_nl < end + 500:  # Only adjust if close
+                end = next_nl + 1
+                chunk = text[start:end]
+        
+        if chunk.strip():
+            # Check token count and split further if needed
+            chunk_tokens = num_tokens(chunk)
+            if chunk_tokens > chunk_size_tokens:
+                # Split further by lines
+                lines = chunk.splitlines()
+                sub = []
+                sub_text = ""
+                for l in lines:
+                    new_sub_text = sub_text + ("\n" if sub_text else "") + l
+                    new_sub_tokens = num_tokens(new_sub_text)
+                    
+                    if new_sub_tokens >= chunk_size_tokens and sub:
+                        chunks.append(sub_text)
+                        sub = [l]
+                        sub_text = l
+                    else:
+                        sub.append(l)
+                        sub_text = new_sub_text
+                if sub:
+                    chunks.append(sub_text)
+            else:
+                chunks.append(chunk)
+        
+        # Move start position with overlap
+        if overlap_tokens > 0 and end < len(text):
+            # Calculate overlap in characters (approximate)
+            overlap_chars = overlap_tokens * 4
+            # Move start back by overlap amount for next chunk
+            start = max(0, end - overlap_chars)
+            # Adjust to line boundary
+            if start > 0:
+                prev_nl = text.rfind("\n", 0, start)
+                if prev_nl != -1:
+                    start = prev_nl + 1
+        else:
+            start = end
+        
+        if start >= len(text):
+            break
+    
+    return chunks
+
+
+def get_cache_key(
+    document_text: str,
+    chunk_size_tokens: int,
+    overlap_tokens: int,
+    encoding_name: str
+) -> str:
+    """Generate unique cache key for document + chunking parameters"""
+    # Hash document text (use first 1000 chars + length for efficiency)
+    doc_hash_input = document_text[:1000] + str(len(document_text))
+    doc_hash = hashlib.md5(doc_hash_input.encode()).hexdigest()
+    # Include chunking parameters in key
+    key = f"{doc_hash}_{chunk_size_tokens}_{overlap_tokens}_{encoding_name}"
+    return key
+
+
+# Module-level cache for chunks
+_chunk_cache: Dict[str, List[str]] = {}
+
+
+def chunk_document_cached(
+    document_text: str,
+    chunk_size_tokens: int,
+    overlap_tokens: int = 0,
+    encoding_name: str = "o200k_base"
+) -> List[str]:
+    """
+    Get chunks for document, using cache if available.
+    
+    Args:
+        document_text: Full document text to chunk
+        chunk_size_tokens: Target token size per chunk
+        overlap_tokens: Number of tokens to overlap between chunks (default: 0)
+        encoding_name: Tiktoken encoding to use
+    
+    Returns:
+        List of text chunks (cached if previously computed)
+    """
+    # Generate cache key
+    cache_key = get_cache_key(document_text, chunk_size_tokens, overlap_tokens, encoding_name)
+    
+    # Check cache
+    if cache_key in _chunk_cache:
+        return _chunk_cache[cache_key]
+    
+    # Chunk document
+    chunks = chunk_document(document_text, chunk_size_tokens, overlap_tokens, encoding_name)
+    
+    # Store in cache (limit cache size to prevent memory issues)
+    if len(_chunk_cache) >= 10:
+        # Remove oldest entry (simple FIFO - remove first key)
+        first_key = next(iter(_chunk_cache))
+        del _chunk_cache[first_key]
+    
+    _chunk_cache[cache_key] = chunks
+    return chunks
+
+
 def extract_field_value_with_gpt(
     document_text: str,
     field: str,
@@ -108,46 +257,13 @@ def extract_field_value_with_gpt(
         project=project_id
     )
     
-    # --- Chunking logic: always by 3000-5000 tokens ---
-    import tiktoken
-    def num_tokens(text):
-        # gpt-4.1 uses o200k_base encoding (200k vocabulary, better compression)
-        enc = tiktoken.get_encoding("o200k_base")
-        return len(enc.encode(text))
-
-    chunks = []
-    chunk_size_tokens = 4000  # target chunk size
-    max_chunk_chars = 16000   # fallback for non-token splitting
-
-    text = document_text
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chunk_chars)
-        chunk = text[start:end]
-        # Try to not break in the middle of a line
-        if end < len(text):
-            next_nl = text.find("\n", end)
-            if next_nl != -1:
-                end = next_nl + 1
-                chunk = text[start:end]
-        if chunk.strip():
-            # Optionally check token count
-            if num_tokens(chunk) > chunk_size_tokens:
-                # Split further by lines
-                lines = chunk.splitlines()
-                sub = []
-                sub_len = 0
-                for l in lines:
-                    sub.append(l)
-                    sub_len = num_tokens("\n".join(sub))
-                    if sub_len >= chunk_size_tokens:
-                        chunks.append("\n".join(sub))
-                        sub = []
-                if sub:
-                    chunks.append("\n".join(sub))
-            else:
-                chunks.append(chunk)
-        start = end
+    # Get cached chunks (with 200 token overlap to prevent boundary issues)
+    chunks = chunk_document_cached(
+        document_text=document_text,
+        chunk_size_tokens=4000,
+        overlap_tokens=200,
+        encoding_name="o200k_base"
+    )
 
     # --- Sequentially send each chunk to GPT-4.1 ---
     location_hint = ""
@@ -198,18 +314,21 @@ def extract_bulk_questions_with_gpt(
     questions: list,
     filename: str,
     line_to_location_map: Optional[Dict[int, int]] = None,
-    file_type: Optional[str] = None
+    file_type: Optional[str] = None,
+    all_documents: Optional[list] = None
 ) -> list:
     """
     Extract answers for multiple questions using GPT-4.1 with confidence scores and citations.
     Uses document chunking to stay within token limits.
+    Supports multiple documents - combines them with document markers.
     
     Args:
-        document_text: The full document text to search
+        document_text: The full document text to search (may contain multiple documents with markers)
         questions: List of question objects with id, text, type, and optional options
-        filename: The document filename for citation
+        filename: The primary document filename for citation
         line_to_location_map: Optional mapping of line numbers to page/paragraph numbers
         file_type: Optional file type ("pdf" or "docx")
+        all_documents: Optional list of document dicts with filename, text, line_map, file_type
     
     Returns:
         List of answer objects with id, answer, confidence, and citation
@@ -248,10 +367,9 @@ def extract_bulk_questions_with_gpt(
         q_payload.append(q_item)
     
     # Calculate token count for questions payload (approximate)
-    import tiktoken
+    # Create encoder once for token counting
+    enc = tiktoken.get_encoding("o200k_base")
     def num_tokens(text):
-        # gpt-4.1 uses o200k_base encoding (200k vocabulary, better compression)
-        enc = tiktoken.get_encoding("o200k_base")
         return len(enc.encode(text))
     
     questions_json = json.dumps(q_payload)
@@ -294,69 +412,34 @@ For each question:
     # Calculate max document tokens per chunk
     max_doc_tokens_per_chunk = max_tokens_per_request - questions_tokens - template_tokens - system_tokens - response_tokens_estimate
     
-    # Chunk the document
-    doc_tokens = num_tokens(document_text)
-    chunks = []
+    # Get cached chunks (with 200 token overlap to prevent boundary issues)
+    chunks = chunk_document_cached(
+        document_text=document_text,
+        chunk_size_tokens=max_doc_tokens_per_chunk,
+        overlap_tokens=200,
+        encoding_name="o200k_base"
+    )
     
-    if doc_tokens <= max_doc_tokens_per_chunk:
-        # Document fits in one chunk
-        chunks.append(document_text)
-    else:
-        # Need to chunk the document
-        chunk_size_tokens = max_doc_tokens_per_chunk
-        max_chunk_chars = chunk_size_tokens * 4  # Rough estimate: 1 token ≈ 4 chars
-        
-        text = document_text
-        start = 0
-        while start < len(text):
-            end = min(len(text), start + max_chunk_chars)
-            chunk = text[start:end]
-            
-            # Try to not break in the middle of a line
-            if end < len(text):
-                next_nl = text.find("\n", end)
-                if next_nl != -1 and next_nl < end + 500:  # Only adjust if close
-                    end = next_nl + 1
-                    chunk = text[start:end]
-            
-            if chunk.strip():
-                # Check token count and split further if needed
-                chunk_tokens = num_tokens(chunk)
-                if chunk_tokens > chunk_size_tokens:
-                    # Split further by lines
-                    lines = chunk.splitlines()
-                    sub = []
-                    sub_tokens = 0
-                    for l in lines:
-                        line_tokens = num_tokens(l)
-                        if sub_tokens + line_tokens >= chunk_size_tokens and sub:
-                            chunks.append("\n".join(sub))
-                            sub = [l]
-                            sub_tokens = line_tokens
-                        else:
-                            sub.append(l)
-                            sub_tokens += line_tokens
-                    if sub:
-                        chunks.append("\n".join(sub))
-                else:
-                    chunks.append(chunk)
-            
-            start = end
-            if start >= len(text):
-                break
-    
+    # Determine if multiple documents
+    is_multiple_docs = all_documents is not None and len(all_documents) > 1
+    doc_names = [d['filename'] for d in all_documents] if all_documents else [filename]
     doc_name = filename
     
     # Process each chunk and merge results
     all_results = {}  # question_id -> best answer (highest confidence or first found)
     
     for chunk_idx, chunk in enumerate(chunks):
+        # Build document context hint for multiple documents
+        doc_context = ""
+        if is_multiple_docs:
+            doc_context = f"\n\nIMPORTANT: You are searching across multiple documents: {', '.join(doc_names)}. Make sure to include the correct document name (docName) in each citation."
+        
         user_content = [
             {
                 "type": "text",
-                "text": f"""{chunk}
+                "text": f"""{chunk}{doc_context}
 
-Return JSON with schema: {{"answers":[{{"id":"q1","answer":<typed>,"confidence":<number>,"citation":{{"docName":"{doc_name}","page":number,"snippet":"exact relevant text from document"}}}}]}}.
+Return JSON with schema: {{"answers":[{{"id":"q1","answer":<typed>,"confidence":<number>,"citation":{{"docName":"name","page":number,"snippet":"exact relevant text from document"}}}}]}}.
 
 IMPORTANT INSTRUCTIONS:
 - For each answer, you MUST include a confidence score (0-1 scale) AND a citation object
