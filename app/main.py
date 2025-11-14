@@ -5,21 +5,88 @@ from app.auth.deps import get_current_user
 from app.auth.schemas import User
 from app.routers import auth
 import traceback
+
+
+
 from app.models import ExtractRequest, ExtractResponse, FileExtractResponse, LocationInfo
 from app.extractor import (
-    extract_field_value_with_gpt,
-    extract_text_from_file_with_location
+  extract_field_value_with_gpt,
+  extract_text_from_file_with_location,
+  extract_bulk_questions_with_gpt
 )
+from app.bulk_models import BulkExtractRequest, BulkExtractResponse, BulkExtractFieldResult, LocationInfo as BulkLocationInfo
 
+
+# Bulk extraction endpoint: extract all fields in one pass
+from fastapi import Body
+from typing import List
 
 app = FastAPI(title="AI Autofill Service")
-
 app.include_router(auth.router)
+
+@app.post("/extract_file_bulk", response_model=BulkExtractResponse)
+async def extract_from_file_bulk(
+  file: UploadFile = File(...),
+  questions: str = Form(...),  # JSON-encoded list of question objects with id, text, type, and optional options
+  current_user: User = Depends(get_current_user)
+) -> BulkExtractResponse:
+  """Extract multiple field values from uploaded file using GPT-4.1 with location tracking, confidence scores, and citations."""
+  import json
+  try:
+    file_bytes = await file.read()
+    text, line_map, file_type = extract_text_from_file_with_location(file.filename, file_bytes)
+  except ValueError as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=400, detail=str(e))
+  except Exception as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=500, detail=f"Failed to read the uploaded file: {str(e)}")
+
+  try:
+    # Parse questions list
+    try:
+      questions_list = json.loads(questions)
+      if not isinstance(questions_list, list):
+        raise ValueError()
+    except Exception:
+      raise HTTPException(status_code=400, detail="'questions' must be a JSON-encoded list of question objects with id, text, type, and optional options.")
+
+    # Use the new bulk extraction function that processes all questions at once
+    formatted_results = extract_bulk_questions_with_gpt(
+      text,
+      questions_list,
+      file.filename,
+      line_to_location_map=line_map,
+      file_type=file_type
+    )
+    
+    # Convert to BulkExtractFieldResult format
+    results = []
+    for result in formatted_results:
+      location = None
+      if result.get("location"):
+        clean_location = {k: v for k, v in result["location"].items() if v is not None}
+        if clean_location:
+          # Use BulkLocationInfo to match BulkExtractFieldResult's expected type
+          location = BulkLocationInfo(**clean_location)
+      results.append(BulkExtractFieldResult(
+        field=result["field"],
+        value=result["value"],
+        location=location
+      ))
+    
+    return BulkExtractResponse(results=results)
+  except ValueError as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=400, detail=str(e))
+  except Exception as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=500, detail=f"Failed to extract fields using GPT-4.1: {str(e)}")
 
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_endpoint(payload: ExtractRequest, current_user: User = Depends(get_current_user)) -> ExtractResponse:
-    """Extract field value from text using GPT-4o"""
+    """Extract field value from text using GPT-4.1"""
     try:
         value, location_data = extract_field_value_with_gpt(
             payload.document_text,
@@ -37,7 +104,7 @@ async def extract_endpoint(payload: ExtractRequest, current_user: User = Depends
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract field using GPT-4o: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract field using GPT-4.1: {str(e)}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -100,6 +167,7 @@ def upload_form() -> HTMLResponse:
             </div>
             <div class=\"row\">
             <!-- Survey Questions UI -->
+            <button id="getAllAnswersBtn" style="margin-bottom:1rem;">Get All Answers</button>
             <div id="surveyQuestions"></div>
             <div id="result"></div>
           </div>
@@ -159,13 +227,6 @@ def upload_form() -> HTMLResponse:
                 input.style.width = '100%';
               }
               row.appendChild(input);
-              // Add Get Answer button
-              const btn = document.createElement('button');
-              btn.textContent = 'Get Answer';
-              btn.type = 'button';
-              btn.style.marginLeft = '1rem';
-              btn.onclick = () => getAnswerForQuestion(q);
-              row.appendChild(btn);
               // Reference/result display
               const answerDiv = document.createElement('div');
               answerDiv.id = `answer${q.id}`;
@@ -175,71 +236,102 @@ def upload_form() -> HTMLResponse:
             });
           }
 
-          // Function to get answer for a question
-          async function getAnswerForQuestion(q) {
+          // Function to get all answers at once
+          async function getAllAnswers() {
             const fileInput = document.getElementById('file');
             const f = fileInput.files?.[0];
-            const resultEl = document.getElementById(`answer${q.id}`);
-            resultEl.textContent = '';
-            if (!f) { resultEl.textContent = 'Please choose a file.'; return; }
-            if (!token) { resultEl.textContent = 'Not authenticated. Please login first.'; return; }
-            // Call /extract_file for this question
+            if (!f) { alert('Please choose a file.'); return; }
+            if (!token) { alert('Not authenticated. Please login first.'); return; }
+            // Prepare questions list with full question objects
             const form = new FormData();
             form.append('file', f);
-            form.append('field', q.text);
+            form.append('questions', JSON.stringify(surveyQuestions));
+            // Disable button while loading
+            const btn = document.getElementById('getAllAnswersBtn');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
             try {
-              const res = await fetch('/extract_file', {
+              console.log('Sending bulk extraction request...');
+              const res = await fetch('/extract_file_bulk', {
                 method: 'POST',
                 body: form,
                 headers: {
                   'Authorization': `Bearer ${token}`
                 }
               });
+              console.log('Response received:', res.status);
               if (res.status === 401) { handleExpiredToken(); return; }
+              if (!res.ok) {
+                const errorText = await res.text();
+                let errorDetail = 'Request failed';
+                try {
+                  const errorData = JSON.parse(errorText);
+                  errorDetail = errorData.detail || errorText;
+                } catch {
+                  errorDetail = errorText || `HTTP ${res.status}`;
+                }
+                console.error('Request failed:', errorDetail);
+                throw new Error(errorDetail);
+              }
               const data = await res.json();
-              if (!res.ok) throw new Error(data.detail || 'Request failed');
-              // Populate the answer field (input/textarea/select) with the extracted value
-              const inputEl = document.getElementById(`q${q.id}`);
-              if (inputEl) {
-                if (inputEl.tagName === 'SELECT') {
-                  // Try to match value to option, else add as custom option
-                  let found = false;
-                  for (let i = 0; i < inputEl.options.length; i++) {
-                    if (inputEl.options[i].value === data.value) {
-                      inputEl.selectedIndex = i;
-                      found = true;
-                      break;
+              console.log('Response data:', data);
+              // Populate all answer fields and reference info
+              if (data.results && Array.isArray(data.results)) {
+                console.log(`Processing ${data.results.length} results`);
+                data.results.forEach(result => {
+                  const q = surveyQuestions.find(q => q.text === result.field);
+                  if (!q) return;
+                  const inputEl = document.getElementById(`q${q.id}`);
+                  const answerDiv = document.getElementById(`answer${q.id}`);
+                  if (inputEl) {
+                    if (inputEl.tagName === 'SELECT') {
+                      let found = false;
+                      for (let i = 0; i < inputEl.options.length; i++) {
+                        if (inputEl.options[i].value === result.value) {
+                          inputEl.selectedIndex = i;
+                          found = true;
+                          break;
+                        }
+                      }
+                      if (!found && result.value) {
+                        const opt = document.createElement('option');
+                        opt.value = result.value;
+                        opt.text = result.value;
+                        inputEl.appendChild(opt);
+                        inputEl.value = result.value;
+                      }
+                    } else if (inputEl.tagName === 'TEXTAREA' || inputEl.type === 'text') {
+                      inputEl.value = result.value ?? '';
                     }
                   }
-                  if (!found && data.value) {
-                    // Add custom option and select it
-                    const opt = document.createElement('option');
-                    opt.value = data.value;
-                    opt.text = data.value;
-                    inputEl.appendChild(opt);
-                    inputEl.value = data.value;
+                  // Reference info
+                  let locationHtml = '';
+                  if (result.location) {
+                    const loc = result.location;
+                    locationHtml = `<div style=\"margin-top: 0.5rem; font-size: 0.95em;\">` +
+                      `${loc.page_number ? `<div>Page: ${loc.page_number}</div>` : ''}` +
+                      `${loc.paragraph_number ? `<div>Paragraph: ${loc.paragraph_number}</div>` : ''}` +
+                      `${loc.line_number ? `<div>Line: ${loc.line_number}</div>` : ''}` +
+                      `${loc.section ? `<div>Section: ${loc.section}</div>` : ''}` +
+                      `${loc.context ? `<div style='margin-top: 0.3rem; font-style: italic;'>Context: ${loc.context}</div>` : ''}` +
+                      `</div>`;
                   }
-                } else if (inputEl.tagName === 'TEXTAREA' || inputEl.type === 'text') {
-                  inputEl.value = data.value ?? '';
-                }
+                  if (answerDiv) answerDiv.innerHTML = locationHtml;
+                });
               }
-              // Show reference info below
-              let locationHtml = '';
-              if (data.location) {
-                const loc = data.location;
-                locationHtml = `<div style=\"margin-top: 0.5rem; font-size: 0.95em;\">` +
-                  `${loc.page_number ? `<div>Page: ${loc.page_number}</div>` : ''}` +
-                  `${loc.paragraph_number ? `<div>Paragraph: ${loc.paragraph_number}</div>` : ''}` +
-                  `${loc.line_number ? `<div>Line: ${loc.line_number}</div>` : ''}` +
-                  `${loc.section ? `<div>Section: ${loc.section}</div>` : ''}` +
-                  `${loc.context ? `<div style='margin-top: 0.3rem; font-style: italic;'>Context: ${loc.context}</div>` : ''}` +
-                  `</div>`;
-              }
-              resultEl.innerHTML = locationHtml;
             } catch (err) {
-              resultEl.textContent = err.message;
+              alert(err.message);
+            } finally {
+              btn.disabled = false;
+              btn.textContent = 'Get All Answers';
             }
           }
+          // Attach Get All Answers button handler
+          document.addEventListener('DOMContentLoaded', function() {
+            const btn = document.getElementById('getAllAnswersBtn');
+            if (btn) btn.onclick = getAllAnswers;
+          });
+
 
           // Function to validate token by making a test request
           async function validateToken(testToken) {
@@ -361,7 +453,7 @@ def upload_form() -> HTMLResponse:
 
 @app.post("/extract_file", response_model=FileExtractResponse)
 async def extract_from_file(file: UploadFile = File(...), field: str = Form(...), current_user: User = Depends(get_current_user)) -> FileExtractResponse:
-    """Extract field value from uploaded file using GPT-4o with location tracking"""
+    """Extract field value from uploaded file using GPT-4.1 with location tracking"""
     try:
         file_bytes = await file.read()
         # Extract text with location metadata
@@ -374,7 +466,7 @@ async def extract_from_file(file: UploadFile = File(...), field: str = Form(...)
         raise HTTPException(status_code=500, detail=f"Failed to read the uploaded file: {str(e)}")
 
     try:
-        # Use GPT-4o for extraction with location tracking
+        # Use GPT-4.1 for extraction with location tracking
         value, location_data = extract_field_value_with_gpt(
             text,
             field,
@@ -398,6 +490,6 @@ async def extract_from_file(file: UploadFile = File(...), field: str = Form(...)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to extract field using GPT-4o: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract field using GPT-4.1: {str(e)}")
 
 
