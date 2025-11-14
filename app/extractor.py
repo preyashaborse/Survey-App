@@ -1,5 +1,6 @@
 import os
 import json
+import tiktoken
 from typing import Optional, Dict, Tuple
 from io import BytesIO
 
@@ -107,75 +108,86 @@ def extract_field_value_with_gpt(
         project=project_id
     )
     
-    # Prepare the prompt with location hints
+    # --- Chunking logic: always by 3000-5000 tokens ---
+    import tiktoken
+    def num_tokens(text):
+        enc = tiktoken.encoding_for_model("gpt-4o")
+        return len(enc.encode(text))
+
+    chunks = []
+    chunk_size_tokens = 4000  # target chunk size
+    max_chunk_chars = 16000   # fallback for non-token splitting
+
+    text = document_text
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chunk_chars)
+        chunk = text[start:end]
+        # Try to not break in the middle of a line
+        if end < len(text):
+            next_nl = text.find("\n", end)
+            if next_nl != -1:
+                end = next_nl + 1
+                chunk = text[start:end]
+        if chunk.strip():
+            # Optionally check token count
+            if num_tokens(chunk) > chunk_size_tokens:
+                # Split further by lines
+                lines = chunk.splitlines()
+                sub = []
+                sub_len = 0
+                for l in lines:
+                    sub.append(l)
+                    sub_len = num_tokens("\n".join(sub))
+                    if sub_len >= chunk_size_tokens:
+                        chunks.append("\n".join(sub))
+                        sub = []
+                if sub:
+                    chunks.append("\n".join(sub))
+            else:
+                chunks.append(chunk)
+        start = end
+
+    # --- Sequentially send each chunk to GPT-4o ---
     location_hint = ""
     if file_type == "pdf":
         location_hint = " If found, provide the page number and approximate line number."
     elif file_type == "docx":
         location_hint = " If found, provide the paragraph number and approximate line number."
-    
-    prompt = f"""You are a document analysis assistant. Extract the value for the field "{field}" from the following document text.
 
-Document Text:
-{document_text}
-
-Instructions:
-1. Find the value associated with the field "{field}" in the document.
-2. The field might appear in various formats like:
-   - "{field}: value"
-   - "{field} = value"
-   - "{field} - value"
-   - Or as a labeled field in a form
-3. Extract the complete value accurately.
-4. Provide location information: approximate line number where found, surrounding context (2-3 lines before and after), and any identifiable section (e.g., "Header", "Body", "Contact Information", etc.).{location_hint}
-
-Return your response as a valid JSON object with this exact structure:
-{{
-    "value": "the extracted value or null if not found",
-    "location": {{
-        "line_number": <approximate line number or null>,
-        "context": "surrounding text context (2-3 lines before and after)",
-        "section": "document section name or null"
-    }}
-}}
-
-If the field is not found, return: {{"value": null, "location": {{"line_number": null, "context": null, "section": null}}}}
-
-Return ONLY valid JSON, no additional text or explanation."""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",  # Using GPT-4o (you can change to "gpt-4-turbo" or "gpt-4" if needed)
-            messages=[
-                {"role": "system", "content": "You are a precise document extraction assistant. Always return valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,  # Low temperature for consistent extraction
-            response_format={"type": "json_object"}  # Force JSON response
-        )
-        
-        result_text = response.choices[0].message.content
-        result = json.loads(result_text)
-        
-        value = result.get("value")
-        location_data = result.get("location", {})
-        
-        # Enhance location data with actual page/paragraph numbers if mapping is available
-        if line_to_location_map and location_data.get("line_number") is not None:
-            line_num = location_data["line_number"]
-            if isinstance(line_num, int) and line_num in line_to_location_map:
-                if file_type == "pdf":
-                    location_data["page_number"] = line_to_location_map.get(line_num)
-                elif file_type == "docx":
-                    location_data["paragraph_number"] = line_to_location_map.get(line_num)
-        
-        return value if value else None, location_data if location_data else None
-        
-    except json.JSONDecodeError as e:
-        # Fallback: try to extract value from response text
-        print(f"JSON decode error: {e}, response: {result_text}")
-        return None, None
-    except Exception as e:
-        print(f"Error calling OpenAI API: {e}")
-        raise Exception(f"Failed to extract field using GPT-4: {str(e)}")
+    for idx, chunk in enumerate(chunks):
+        prompt = f"""You are a document analysis assistant. Extract the value for the field \"{field}\" from the following document text.\n\nDocument Text:\n{chunk}\n\nInstructions:\n1. Find the value associated with the field \"{field}\" in the document.\n2. The field might appear in various formats like:\n   - \"{field}: value\"\n   - \"{field} = value\"\n   - \"{field} - value\"\n   - Or as a labeled field in a form\n3. Extract the complete value accurately.\n4. Provide location information: approximate line number where found, surrounding context (2-3 lines before and after), and any identifiable section (e.g., \"Header\", \"Body\", \"Contact Information\", etc.).{location_hint}\n\nReturn your response as a valid JSON object with this exact structure:\n{{\n    \"value\": \"the extracted value or null if not found\",\n    \"location\": {{\n        \"line_number\": <approximate line number or null>,\n        \"context\": \"surrounding text context (2-3 lines before and after)\",\n        \"section\": \"document section name or null\"\n    }}\n}}\n\nIf the field is not found, return: {{\"value\": null, \"location\": {{\"line_number\": null, \"context\": null, \"section\": null}}}}\n\nReturn ONLY valid JSON, no additional text or explanation."""
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a precise document extraction assistant. Always return valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            result_text = response.choices[0].message.content
+            result = json.loads(result_text)
+            value = result.get("value")
+            location_data = result.get("location", {})
+            # Enhance location data with actual page/paragraph numbers if mapping is available
+            if line_to_location_map and location_data.get("line_number") is not None:
+                line_num = location_data["line_number"]
+                if isinstance(line_num, int) and line_num in line_to_location_map:
+                    if file_type == "pdf":
+                        location_data["page_number"] = line_to_location_map.get(line_num)
+                    elif file_type == "docx":
+                        location_data["paragraph_number"] = line_to_location_map.get(line_num)
+            # If value found, return immediately
+            if value:
+                return value, location_data if location_data else None
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error: {e}, response: {result_text}")
+            continue
+        except Exception as e:
+            print(f"Error calling OpenAI API: {e}")
+            continue
+    # If not found in any chunk
+    return None, None
 

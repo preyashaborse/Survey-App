@@ -8,7 +8,7 @@ fake_users_db = {
     "preyasha": {
         "username": "preyasha",
         "full_name": "Preyasha Borse",
-        "hashed_password": "$2b$12$e/KJX1UvLMwBOGesv7eDUuA.N46RFHrh05nxxk99rvTQyTwf4b7eq",
+        "hashed_password": "$2b$12$SPPWqLbqsHGfzW6KuOcb9eHuThd0Ow0B8c1rjJlsZ8M81kFR5sYpK",
         "disabled": False,
     }
 }

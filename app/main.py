@@ -99,19 +99,148 @@ def upload_form() -> HTMLResponse:
               <div id=\"filename\" class=\"muted mono\"></div>
             </div>
             <div class=\"row\">
-              <label for=\"field\">Field to extract</label>
-              <input id=\"field\" name=\"field\" type=\"text\" placeholder=\"e.g., Email\" />
-            </div>
-            <div class=\"row\">
-              <button id=\"submit\">Extract</button>
-            </div>
-            <div id=\"result\"></div>
+            <!-- Survey Questions UI -->
+            <div id="surveyQuestions"></div>
+            <div id="result"></div>
           </div>
         </div>
 
         <script>
           let token = null;
-          
+
+          // Survey questions definition
+          const surveyQuestions = [
+            { id: 1, text: 'Do you currently have a SOC 2 Type II Report?', type: 'yesno' },
+            { id: 2, text: 'If yes, mention the audit firm name and reporting period.', type: 'text' },
+            { id: 3, text: 'Do you plan to pursue SOC 2 certification within the next 12 months?', type: 'yesno' },
+            { id: 4, text: 'Provide a brief overview of your information security governance structure (e.g., CISO, InfoSec committee).', type: 'text' },
+            { id: 5, text: 'Is there a documented and approved Information Security Policy?', type: 'yesno' },
+            { id: 6, text: 'Are employees required to complete security awareness training annually?', type: 'yesno' },
+            { id: 7, text: 'How frequently are user access rights reviewed?', type: 'dropdown', options: ['Monthly', 'Quarterly', 'Annually', 'Other'] },
+            { id: 8, text: 'Describe your incident response process, including escalation and communication flow.', type: 'text' },
+            { id: 9, text: 'Is multi-factor authentication (MFA) enabled for administrative and critical systems?', type: 'yesno' },
+            { id: 10, text: 'How often are vulnerability scans performed on your production environment?', type: 'dropdown', options: ['Monthly', 'Quarterly', 'Annually', 'Other'] },
+            { id: 11, text: 'Do you have a documented Business Continuity and Disaster Recovery (BCP/DR) plan?', type: 'yesno' },
+            { id: 12, text: 'When was your last BCP/DR test conducted?', type: 'dropdown', options: ['Last 3 months', 'Last 6 months', 'Last year', 'Other'] },
+            { id: 13, text: 'What is your average system uptime (%) over the last 12 months?', type: 'text' },
+            { id: 14, text: 'Are change management procedures documented and approved before deployment?', type: 'yesno' },
+            { id: 15, text: 'Are data inputs and outputs validated for accuracy and completeness?', type: 'yesno' },
+            { id: 16, text: 'Do you classify and label data based on sensitivity/confidentiality?', type: 'yesno' },
+            { id: 17, text: 'Describe the encryption methods used to protect data at rest and in transit.', type: 'text' },
+            { id: 18, text: 'Do you collect or process personally identifiable information (PII) or personal data?', type: 'yesno' },
+            { id: 19, text: 'Which privacy regulation primarily applies to your organization?', type: 'dropdown', options: ['GDPR', 'CCPA', 'HIPAA', 'Other'] },
+            { id: 20, text: 'Provide details of any ongoing initiatives or planned improvements toward SOC 2 compliance.', type: 'text' }
+          ];
+
+          // Function to render survey questions
+          function renderSurveyQuestions() {
+            const container = document.getElementById('surveyQuestions');
+            container.innerHTML = '';
+            surveyQuestions.forEach(q => {
+              const row = document.createElement('div');
+              row.className = 'row';
+              const label = document.createElement('label');
+              label.textContent = q.text;
+              label.setAttribute('for', `q${q.id}`);
+              row.appendChild(label);
+              let input;
+              if (q.type === 'yesno') {
+                input = document.createElement('select');
+                input.id = `q${q.id}`;
+                input.innerHTML = '<option value="">Select</option><option value="Yes">Yes</option><option value="No">No</option>';
+              } else if (q.type === 'dropdown') {
+                input = document.createElement('select');
+                input.id = `q${q.id}`;
+                input.innerHTML = '<option value="">Select</option>' + (q.options || []).map(opt => `<option value="${opt}">${opt}</option>`).join('');
+              } else if (q.type === 'text') {
+                input = document.createElement('textarea');
+                input.id = `q${q.id}`;
+                input.rows = 2;
+                input.style.width = '100%';
+              }
+              row.appendChild(input);
+              // Add Get Answer button
+              const btn = document.createElement('button');
+              btn.textContent = 'Get Answer';
+              btn.type = 'button';
+              btn.style.marginLeft = '1rem';
+              btn.onclick = () => getAnswerForQuestion(q);
+              row.appendChild(btn);
+              // Reference/result display
+              const answerDiv = document.createElement('div');
+              answerDiv.id = `answer${q.id}`;
+              answerDiv.className = 'muted';
+              row.appendChild(answerDiv);
+              container.appendChild(row);
+            });
+          }
+
+          // Function to get answer for a question
+          async function getAnswerForQuestion(q) {
+            const fileInput = document.getElementById('file');
+            const f = fileInput.files?.[0];
+            const resultEl = document.getElementById(`answer${q.id}`);
+            resultEl.textContent = '';
+            if (!f) { resultEl.textContent = 'Please choose a file.'; return; }
+            if (!token) { resultEl.textContent = 'Not authenticated. Please login first.'; return; }
+            // Call /extract_file for this question
+            const form = new FormData();
+            form.append('file', f);
+            form.append('field', q.text);
+            try {
+              const res = await fetch('/extract_file', {
+                method: 'POST',
+                body: form,
+                headers: {
+                  'Authorization': `Bearer ${token}`
+                }
+              });
+              if (res.status === 401) { handleExpiredToken(); return; }
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.detail || 'Request failed');
+              // Populate the answer field (input/textarea/select) with the extracted value
+              const inputEl = document.getElementById(`q${q.id}`);
+              if (inputEl) {
+                if (inputEl.tagName === 'SELECT') {
+                  // Try to match value to option, else add as custom option
+                  let found = false;
+                  for (let i = 0; i < inputEl.options.length; i++) {
+                    if (inputEl.options[i].value === data.value) {
+                      inputEl.selectedIndex = i;
+                      found = true;
+                      break;
+                    }
+                  }
+                  if (!found && data.value) {
+                    // Add custom option and select it
+                    const opt = document.createElement('option');
+                    opt.value = data.value;
+                    opt.text = data.value;
+                    inputEl.appendChild(opt);
+                    inputEl.value = data.value;
+                  }
+                } else if (inputEl.tagName === 'TEXTAREA' || inputEl.type === 'text') {
+                  inputEl.value = data.value ?? '';
+                }
+              }
+              // Show reference info below
+              let locationHtml = '';
+              if (data.location) {
+                const loc = data.location;
+                locationHtml = `<div style=\"margin-top: 0.5rem; font-size: 0.95em;\">` +
+                  `${loc.page_number ? `<div>Page: ${loc.page_number}</div>` : ''}` +
+                  `${loc.paragraph_number ? `<div>Paragraph: ${loc.paragraph_number}</div>` : ''}` +
+                  `${loc.line_number ? `<div>Line: ${loc.line_number}</div>` : ''}` +
+                  `${loc.section ? `<div>Section: ${loc.section}</div>` : ''}` +
+                  `${loc.context ? `<div style='margin-top: 0.3rem; font-style: italic;'>Context: ${loc.context}</div>` : ''}` +
+                  `</div>`;
+              }
+              resultEl.innerHTML = locationHtml;
+            } catch (err) {
+              resultEl.textContent = err.message;
+            }
+          }
+
           // Function to validate token by making a test request
           async function validateToken(testToken) {
             try {
@@ -123,18 +252,11 @@ def upload_form() -> HTMLResponse:
                 },
                 body: JSON.stringify({ document_text: '', field: '' })
               });
-              // If 401, token is invalid/expired
-              if (res.status === 401) {
-                return false;
-              }
-              // Any other response means token is still valid
+              if (res.status === 401) { return false; }
               return true;
-            } catch (err) {
-              // On network error, assume token might still be valid
-              return true;
-            }
+            } catch (err) { return true; }
           }
-          
+
           // Function to handle expired/invalid token
           function handleExpiredToken() {
             localStorage.removeItem('authToken');
@@ -146,13 +268,13 @@ def upload_form() -> HTMLResponse:
             document.getElementById('password').value = '';
             document.getElementById('result').textContent = '';
             document.getElementById('file').value = '';
-            document.getElementById('field').value = '';
             document.getElementById('filename').textContent = '';
+            renderSurveyQuestions();
           }
           
           window.onload = async function() {
             token = localStorage.getItem('authToken');
-            
+
             // On page load, check if token exists
             if (token) {
               // Validate token is still valid
@@ -160,6 +282,7 @@ def upload_form() -> HTMLResponse:
               if (isValid) {
                 document.getElementById('authSection').style.display = 'none';
                 document.getElementById('extractSection').style.display = 'block';
+                renderSurveyQuestions();
               } else {
                 // Token expired, fall back to login
                 handleExpiredToken();
@@ -175,9 +298,9 @@ def upload_form() -> HTMLResponse:
               const password = document.getElementById('password').value;
               const messageEl = document.getElementById('authMessage');
               messageEl.textContent = '';
-              
+
               if (!username || !password) {
-                messageEl.innerHTML = '<div class=\"error\">Please enter username and password.</div>';
+                messageEl.innerHTML = '<div class="error">Please enter username and password.</div>';
                 return;
               }
 
@@ -188,16 +311,17 @@ def upload_form() -> HTMLResponse:
                 const res = await fetch('/auth/token', { method: 'POST', body: formData });
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.detail || 'Login failed');
-                
+
                 // Store token and switch to extract view
                 token = data.access_token;
                 localStorage.setItem('authToken', token);
-                messageEl.innerHTML = '<div class=\"success\">Login successful!</div>';
-                
+                messageEl.innerHTML = '<div class="success">Login successful!</div>';
+
                 // Show extract section, hide auth section
                 document.getElementById('authSection').style.display = 'none';
                 document.getElementById('extractSection').style.display = 'block';
-                
+                renderSurveyQuestions();
+
                 // Clear input fields
                 document.getElementById('username').value = '';
                 document.getElementById('password').value = '';
@@ -217,7 +341,7 @@ def upload_form() -> HTMLResponse:
               document.getElementById('authMessage').textContent = '';
               document.getElementById('result').textContent = '';
               document.getElementById('file').value = '';
-              document.getElementById('field').value = '';
+              renderSurveyQuestions();
             });
 
             // File upload tracking
@@ -226,57 +350,6 @@ def upload_form() -> HTMLResponse:
             fileInput.addEventListener('change', () => {
               const f = fileInput.files?.[0];
               filenameEl.textContent = f ? `Uploaded: ${f.name}` : '';
-            });
-
-            // Extract button click handler
-            document.getElementById('submit').addEventListener('click', async () => {
-              const f = fileInput.files?.[0];
-              const field = document.getElementById('field').value;
-              const resultEl = document.getElementById('result');
-              resultEl.textContent = '';
-              if (!f) { resultEl.textContent = 'Please choose a file.'; return; }
-              if (!field) { resultEl.textContent = 'Please enter a field.'; return; }
-              if (!token) { resultEl.textContent = 'Not authenticated. Please login first.'; return; }
-              
-              const form = new FormData();
-              form.append('file', f);
-              form.append('field', field);
-              try {
-                const res = await fetch('/extract_file', { 
-                  method: 'POST', 
-                  body: form,
-                  headers: {
-                    'Authorization': `Bearer ${token}`
-                  }
-                });
-                
-                // If 401, token expired or invalid
-                if (res.status === 401) {
-                  handleExpiredToken();
-                  return;
-                }
-                
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Request failed');
-                let locationHtml = '';
-                if (data.location) {
-                  const loc = data.location;
-                  locationHtml = `<div style="margin-top: 1rem; padding: 1rem; background: #f3f4f6; border-radius: 8px;">
-                    <strong>Location Information:</strong><br/>
-                    ${loc.page_number ? `<div>Page: ${loc.page_number}</div>` : ''}
-                    ${loc.paragraph_number ? `<div>Paragraph: ${loc.paragraph_number}</div>` : ''}
-                    ${loc.line_number ? `<div>Line: ${loc.line_number}</div>` : ''}
-                    ${loc.section ? `<div>Section: ${loc.section}</div>` : ''}
-                    ${loc.context ? `<div style="margin-top: 0.5rem; font-style: italic; color: #6b7280;">Context: ${loc.context}</div>` : ''}
-                  </div>`;
-                }
-                resultEl.innerHTML = `<div><strong>Filename:</strong> ${data.filename}</div>` +
-                                     `<div><strong>Field:</strong> ${data.field}</div>` +
-                                     `<div><strong>Value:</strong> ${data.value ?? 'Not found'}</div>` +
-                                     locationHtml;
-              } catch (err) {
-                resultEl.textContent = err.message;
-              }
             });
           };
         </script>
