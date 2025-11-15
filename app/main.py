@@ -95,7 +95,7 @@ async def extract_from_file_bulk(
       raise HTTPException(status_code=400, detail="'questions' must be a JSON-encoded list of question objects with id, text, type, and optional options.")
 
     # Use the bulk extraction function with combined text and document info
-    formatted_results = extract_bulk_questions_with_gpt(
+    formatted_results = await extract_bulk_questions_with_gpt(
       combined_text,
       questions_list,
       primary_filename,  # Use first filename as primary
@@ -116,7 +116,8 @@ async def extract_from_file_bulk(
       results.append(BulkExtractFieldResult(
         field=result["field"],
         value=result["value"],
-        location=location
+        location=location,
+        confidence=result.get("confidence")  # Include confidence score
       ))
     
     return BulkExtractResponse(results=results)
@@ -363,6 +364,11 @@ def upload_form() -> HTMLResponse:
                       `${loc.section ? `<div>Section: ${loc.section}</div>` : ''}` +
                       `${loc.context ? `<div style='margin-top: 0.3rem; font-style: italic;'>Context: ${loc.context}</div>` : ''}` +
                       `</div>`;
+                  }
+                  // Add AI Confidence Level display after every answer
+                  if (result.confidence !== undefined && result.confidence !== null) {
+                    const confidencePercent = (result.confidence * 100).toFixed(1);
+                    locationHtml += `<div style=\"margin-top: 0.5rem; font-size: 0.95em; font-weight: 500;\">AI Confidence Level - ${confidencePercent}%</div>`;
                   }
                   if (answerDiv) answerDiv.innerHTML = locationHtml;
                 });

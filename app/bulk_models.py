@@ -17,6 +17,7 @@ class BulkExtractFieldResult(BaseModel):
     field: str
     value: str | None
     location: Optional[LocationInfo] = None
+    confidence: Optional[float] = None  # AI confidence level (0.0 to 1.0)
 
 class BulkExtractResponse(BaseModel):
     results: List[BulkExtractFieldResult]

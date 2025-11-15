@@ -2,12 +2,13 @@ import os
 import json
 import tiktoken
 import hashlib
+import asyncio
 from typing import Optional, Dict, Tuple, List
 from io import BytesIO
 
 from docx import Document  # python-docx
 from pypdf import PdfReader
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
 # Load environment variables from project root .env file
@@ -309,7 +310,7 @@ def extract_field_value_with_gpt(
     return None, None
 
 
-def extract_bulk_questions_with_gpt(
+async def extract_bulk_questions_with_gpt(
     document_text: str,
     questions: list,
     filename: str,
@@ -339,7 +340,8 @@ def extract_bulk_questions_with_gpt(
     
     project_id = os.getenv("OPENAI_PROJECT_ID")
     
-    client = OpenAI(
+    # Use AsyncOpenAI for parallel processing
+    client = AsyncOpenAI(
         api_key=api_key,
         project=project_id
     )
@@ -425,15 +427,14 @@ For each question:
     doc_names = [d['filename'] for d in all_documents] if all_documents else [filename]
     doc_name = filename
     
-    # Process each chunk and merge results
-    all_results = {}  # question_id -> best answer (highest confidence or first found)
+    # Build document context hint for multiple documents
+    doc_context = ""
+    if is_multiple_docs:
+        doc_context = f"\n\nIMPORTANT: You are searching across multiple documents: {', '.join(doc_names)}. Make sure to include the correct document name (docName) in each citation."
     
-    for chunk_idx, chunk in enumerate(chunks):
-        # Build document context hint for multiple documents
-        doc_context = ""
-        if is_multiple_docs:
-            doc_context = f"\n\nIMPORTANT: You are searching across multiple documents: {', '.join(doc_names)}. Make sure to include the correct document name (docName) in each citation."
-        
+    # Define async function to process a single chunk
+    async def process_chunk(chunk_idx: int, chunk: str) -> dict:
+        """Process a single chunk and return results as a dict."""
         user_content = [
             {
                 "type": "text",
@@ -483,7 +484,7 @@ For each question:
         ]
         
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model="gpt-4.1",
                 messages=messages,
                 temperature=0.1,
@@ -492,7 +493,8 @@ For each question:
             result_text = response.choices[0].message.content
             result = json.loads(result_text)
             
-            # Parse answers from this chunk
+            # Return chunk results as dict: {question_id: {answer_data}}
+            chunk_results = {}
             answers = result.get("answers", [])
             
             for answer in answers:
@@ -515,64 +517,77 @@ For each question:
                 if not original_q:
                     continue
                 
-                # Check if we already have an answer for this question
-                existing = all_results.get(q_num)
-                
-                # Keep this answer if:
-                # 1. We don't have an answer yet, OR
-                # 2. This answer has higher confidence, OR
-                # 3. This answer has confidence > 0 and existing doesn't
-                should_keep = False
-                if existing is None:
-                    should_keep = True
-                elif confidence > existing.get("confidence", 0.0):
-                    should_keep = True
-                elif confidence > 0 and existing.get("confidence", 0.0) == 0:
-                    should_keep = True
-                
-                if should_keep:
-                    # Build location info from citation
-                    location_data = {}
-                    if citation:
-                        if citation.get("page"):
-                            if file_type == "pdf":
-                                location_data["page_number"] = citation["page"]
-                            elif file_type == "docx":
-                                location_data["paragraph_number"] = citation["page"]
-                        
-                        if citation.get("snippet"):
-                            location_data["context"] = citation["snippet"]
-                        
-                        if citation.get("docName"):
-                            location_data["docName"] = citation["docName"]
+                # Build location info from citation
+                location_data = {}
+                if citation:
+                    if citation.get("page"):
+                        if file_type == "pdf":
+                            location_data["page_number"] = citation["page"]
+                        elif file_type == "docx":
+                            location_data["paragraph_number"] = citation["page"]
                     
-                    # Convert answer value based on question type
-                    final_value = answer_value
-                    if original_q.get('type') == 'yesno':
-                        if isinstance(answer_value, bool):
-                            final_value = "Yes" if answer_value else "No"
-                        elif isinstance(answer_value, str):
-                            final_value = answer_value
-                    elif original_q.get('type') == 'dropdown' and isinstance(answer_value, str):
-                        options = original_q.get('options', [])
-                        if answer_value not in options and options:
-                            matched = next((opt for opt in options if opt.lower() == answer_value.lower()), None)
-                            final_value = matched if matched else answer_value
+                    if citation.get("snippet"):
+                        location_data["context"] = citation["snippet"]
                     
-                    all_results[q_num] = {
-                        "question_id": q_num,
-                        "field": original_q['text'],
-                        "value": str(final_value) if final_value is not None else None,
-                        "confidence": confidence,
-                        "location": location_data if location_data else None
-                    }
+                    if citation.get("docName"):
+                        location_data["docName"] = citation["docName"]
+                
+                # Convert answer value based on question type
+                final_value = answer_value
+                if original_q.get('type') == 'yesno':
+                    if isinstance(answer_value, bool):
+                        final_value = "Yes" if answer_value else "No"
+                    elif isinstance(answer_value, str):
+                        final_value = answer_value
+                elif original_q.get('type') == 'dropdown' and isinstance(answer_value, str):
+                    options = original_q.get('options', [])
+                    if answer_value not in options and options:
+                        matched = next((opt for opt in options if opt.lower() == answer_value.lower()), None)
+                        final_value = matched if matched else answer_value
+                
+                chunk_results[q_num] = {
+                    "question_id": q_num,
+                    "field": original_q['text'],
+                    "value": str(final_value) if final_value is not None else None,
+                    "confidence": confidence,
+                    "location": location_data if location_data else None
+                }
+            
+            return chunk_results
         
         except json.JSONDecodeError as e:
             print(f"JSON decode error in chunk {chunk_idx + 1}: {e}")
-            continue  # Skip this chunk and continue with next
+            return {}  # Return empty dict on error
         except Exception as e:
             print(f"Error processing chunk {chunk_idx + 1}: {e}")
-            continue  # Skip this chunk and continue with next
+            return {}  # Return empty dict on error
+    
+    # Process all chunks in parallel using asyncio.gather
+    chunk_tasks = [process_chunk(chunk_idx, chunk) for chunk_idx, chunk in enumerate(chunks)]
+    chunk_results_list = await asyncio.gather(*chunk_tasks)
+    
+    # Merge results from all chunks, keeping best answer (highest confidence) per question
+    all_results = {}  # question_id -> best answer (highest confidence or first found)
+    
+    for chunk_results in chunk_results_list:
+        for q_num, answer_data in chunk_results.items():
+            existing = all_results.get(q_num)
+            confidence = answer_data.get("confidence", 0.0)
+            
+            # Keep this answer if:
+            # 1. We don't have an answer yet, OR
+            # 2. This answer has higher confidence, OR
+            # 3. This answer has confidence > 0 and existing doesn't
+            should_keep = False
+            if existing is None:
+                should_keep = True
+            elif confidence > existing.get("confidence", 0.0):
+                should_keep = True
+            elif confidence > 0 and existing.get("confidence", 0.0) == 0:
+                should_keep = True
+            
+            if should_keep:
+                all_results[q_num] = answer_data
     
     # Convert results dict to list, ensuring all questions are represented
     formatted_results = []
